@@ -3,15 +3,13 @@ from hdbcli import dbapi
 from pydantic import BaseModel
 from langchain_community.vectorstores.hanavector import HanaDB
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain.docstore.document import Document
 from langchain_community.llms import HuggingFaceEndpoint
 from langchain.prompts import ChatPromptTemplate
 from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 
 app = Flask(__name__)
 
-# Global variables for model instances and configurations
+# Global variables
 connection = None
 vector_db = None
 retrieval_chain = None
@@ -28,70 +26,52 @@ class QueryPayload(BaseModel):
 def welcome():
     return jsonify({"message": "Welcome to the SAP HANA-based AI Chatbot API!"})
 
-
-@app.route("/getHome",methods=["GET"])
-def home():
-    return jsonify({"message": "Welcome to my home"})
-
 @app.route("/configure", methods=["POST"])
 def configure():
     global connection, vector_db, retrieval_chain
 
     try:
         config_payload = ConfigPayload(**request.json)
-        app_info = config_payload.appInfo
         db_config = config_payload.DbConfig
         selected_model = config_payload.selctedModel
 
         # Connect to SAP HANA
-        try:
-            connection = dbapi.connect(
-                address=db_config['hana_host'],
-                port=int(db_config['hana_port']),
-                user=db_config['hana_user'],
-                password=db_config['hana_password']
-            )
-            print("Successfully connected to HANA database")
-        except Exception as e:
-            return jsonify({"error": "Failed to connect to SAP HANA DB"}), 500
-
-        # Initialize vector DB and embedding model with reduced memory usage
-        embedding_model = selected_model.get("embedding") or "intfloat/multilingual-e5-small"
-        embed = SentenceTransformerEmbeddings(model_name=embedding_model)
-        vector_db = HanaDB(
-            embedding=embed,
-            connection=connection,
-            table_name="VECTORTABLE"
+        connection = dbapi.connect(
+            address=db_config['hana_host'],
+            port=int(db_config['hana_port']),
+            user=db_config['hana_user'],
+            password=db_config['hana_password']
         )
+        
+        # Initialize vector DB and embeddings
+        embedding_model = selected_model.get("embedding", "intfloat/multilingual-e5-small")
+        embed = SentenceTransformerEmbeddings(model_name=embedding_model)
+        vector_db = HanaDB(embedding=embed, connection=connection, table_name="VECTORTABLE")
 
-        # Fetch and process documents in small batches to manage memory
+        # Fetch data from tables in batches to optimize memory
         cursor = connection.cursor()
         cursor.execute("SELECT TABLE_NAME FROM SYS.TABLES WHERE SCHEMA_NAME = 'DBADMIN'")
         tables = [row[0] for row in cursor.fetchall()]
 
         for table_name in tables:
-            cursor.execute(f'SELECT * FROM "{table_name}" LIMIT 100')  # Fetching only 100 rows at a time
-            rows = cursor.fetchall()
-            for row in rows:
-                combined_text = ",".join(str(value) if value else 'NULL' for value in row)
-                document = Document(page_content=combined_text.strip(), metadata={"table": table_name})
-                vector_db.add_documents([document])  # Directly add to vector DB
+            cursor.execute(f'SELECT * FROM "{table_name}" LIMIT 100')
+            for row in cursor.fetchall():
+                combined_text = ",".join(str(value) or 'NULL' for value in row)
+                vector_db.add_documents([{"page_content": combined_text, "metadata": {"table": table_name}}])
 
-        # Configure the Hugging Face model
+        # Set up Hugging Face model for response generation
         llm = HuggingFaceEndpoint(
-            repo_id=selected_model.get("textGeneration") or "mistralai/Mistral-7B-Instruct-v0.3",
+            repo_id=selected_model.get("textGeneration", "mistralai/Mistral-7B-Instruct-v0.3"),
             huggingfacehub_api_token="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"  # Replace with actual token
         )
 
-        # Define prompt template
+        # Configure retrieval chain
         prompt_template = ChatPromptTemplate.from_template("""
-            You are an AI-based chatbot assistant. Respond based on provided SAP HANA DB data.
+            You are an AI assistant. Respond based on provided SAP HANA DB data.
             {context}
             Question: {input}
         """)
-        document_chain = create_stuff_documents_chain(llm, prompt_template)
-        retriever = vector_db.as_retriever()
-        retrieval_chain = create_retrieval_chain(retriever, document_chain)
+        retrieval_chain = create_retrieval_chain(vector_db.as_retriever(), prompt_template, llm)
 
         return jsonify({"message": "Configuration completed successfully"})
     
@@ -100,23 +80,15 @@ def configure():
 
 @app.route("/query", methods=["POST"])
 def query():
-    global retrieval_chain, vector_db
-
     try:
-        query_payload = QueryPayload(**request.json)
-        user_query = query_payload.input
+        user_query = QueryPayload(**request.json).input
 
-        # Perform similarity search in vector DB
+        # Retrieve relevant documents and process query
         docs = vector_db.similarity_search(user_query, k=2)
-        combined_context = "\n\n".join([doc.page_content for doc in docs])
-
-        # Run the query through the retrieval chain
+        combined_context = "\n\n".join(doc.page_content for doc in docs)
         response = retrieval_chain.invoke({"input": user_query, "context": combined_context})
 
-        return jsonify({
-            "answer": response['answer'],
-            "details": response
-        })
+        return jsonify({"answer": response['answer']})
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
