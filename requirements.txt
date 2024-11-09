@@ -1,5 +1,5 @@
 Flask==2.2.2
-hdbcli==2.16.17
+hdbcli==2.16.26
 pydantic==1.10.2
 langchain-community==0.0.2
 sentence-transformers==2.2.2
