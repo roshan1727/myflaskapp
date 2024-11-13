@@ -1,6 +1,9 @@
-Flask
-hdbcli
+
+hdbcli 
+langchain
+Document
+langchain_community
+flask
 pydantic
-langchain-community
-sentence-transformers
-transformers
+langchain_huggingface
+
