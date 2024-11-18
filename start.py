@@ -142,5 +142,11 @@ def query():
         return jsonify({"error": str(e)}), 500
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
+if __name__ == '__main__':
+  # If the app is running locally
+    if cf_port is None:
+    # Use port 5000
+        app.run(host='0.0.0.0', port=5001, debug=True)
+    else:
+    # Else use cloud foundry default port
+        app.run(host='0.0.0.0', port=int(cf_port), debug=False)
