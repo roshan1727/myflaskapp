@@ -1,152 +1,130 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from hdbcli import dbapi
-from pydantic import BaseModel
-from langchain_community.vectorstores.hanavector import HanaDB
-from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
+from gen_ai_hub.proxy.langchain.openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.docstore.document import Document
-from langchain_huggingface import HuggingFaceEndpoint
+from langchain_community.vectorstores.hanavector import HanaDB
 from langchain.prompts import ChatPromptTemplate
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
+from gen_ai_hub.proxy.core.proxy_clients import get_proxy_client
+import os
 
 app = Flask(__name__)
 
-# Global variables for model instances and configurations
-connection = None
-vector_db = None
+# Initialize global variables
+hana_conn = None
+hana_vectordb = None
 retrieval_chain = None
+total_records= None
 
-class ConfigPayload(BaseModel):
-    appInfo: dict
-    DbConfig: dict
-    selctedModel: dict
+# Define environment variables for SAP GenAI
+os.environ['AICORE_CLIENT_ID'] = "sb-42a29a03-b2f4-47de-9a41-e0936be9aaf5!b256749|aicore!b164"
+os.environ['AICORE_AUTH_URL'] = "https://gen-ai.authentication.us10.hana.ondemand.com"
+os.environ['AICORE_CLIENT_SECRET'] = "b5e6caee-15aa-493a-a6ac-1fef0ab6e9fe$Satg7UGYPLsz5YYeXefHpbwTfEqqCkQEbasMDPGHAgU="
+os.environ['AICORE_RESOURCE_GROUP'] = "default"
+os.environ['AICORE_BASE_URL'] = "https://api.ai.prod.us-east-1.aws.ml.hana.ondemand.com/v2"
 
-class QueryPayload(BaseModel):
-    input: str
+EMBEDDING_DEPLOYMENT_ID = "dc34e8c0d316a34b"
+LLM_DEPLOYMENT_ID = "dd52e3661060696b"
 
-@app.route("/", methods=["GET"])
+# Initialize the proxy client
+proxy_client = get_proxy_client("gen-ai-hub")
+embeddings = OpenAIEmbeddings(deployment_id=EMBEDDING_DEPLOYMENT_ID)
+llm = ChatOpenAI(deployment_id=LLM_DEPLOYMENT_ID)
+
+
+@app.route("/",methods=['GET'])
 def welcome():
-    return jsonify({"message": "Welcome to the SAP HANA-based AI Chatbot API!"})
+    return jsonify({"status": "welcome to the API is running"}), 200
 
-@app.route("/getHome",methods=["GET"])
-def home():
-    return jsonify({"message": "Welcome to my home"})
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "API is running"}), 200
 
-@app.route("/configure", methods=["POST"])
-def configure():
-    global connection, vector_db, retrieval_chain
+@app.route('/configure', methods=['POST'])
+def configure_database():
+    global hana_conn, hana_vectordb, retrieval_chain , total_records
+
+    # Get the configuration payload
+    payload = request.json
+    host = payload.get("host")
+    port = payload.get("port")
+    user = payload.get("user")
+    password = payload.get("password")
 
     try:
-        config_payload = ConfigPayload(**request.json)
-        app_info = config_payload.appInfo
-        db_config = config_payload.DbConfig
-        selected_model = config_payload.selctedModel
-
         # Connect to SAP HANA
-        try:
-            connection = dbapi.connect(
-                address=db_config['hana_host'],
-                port=int(db_config['hana_port']),
-                user=db_config['hana_user'],
-                password=db_config['hana_password']
+        hana_conn = dbapi.connect(
+            address=host,
+            port=port,
+            user=user,
+            password=password
+        )
+        cur = hana_conn.cursor()
+        cur.execute("TRUNCATE TABLE VECTORTABLE")
+
+        # Fetch data from SAP HANA
+        fetch_sql = "SELECT * FROM DBADMIN.DIX_TABLE1"
+        cur.execute(fetch_sql)
+        rows = cur.fetchall()
+
+        # Convert rows to LangChain Documents
+        documents = [
+            Document(
+                page_content=",".join(str(value) if value else 'NULL' for value in row).strip(),
+                metadata={}
             )
-            print("Successfully connected to HANA database")
-        except Exception as e:
-            return jsonify({"error": "Failed to connect to SAP HANA DB"}), 500
+            for row in rows
+        ]
 
-        # Initialize vector DB and embedding model
-        embedding_model = selected_model.get("embedding") or "intfloat/multilingual-e5-small"
-        embed = SentenceTransformerEmbeddings(model_name=embedding_model)
-        vector_db = HanaDB(
-            embedding=embed,
-            connection=connection,
-            table_name="VECTORTABLE"
-        )
+        # Initialize the HanaDB vector store and store embeddings
+        hana_vectordb = HanaDB(embedding=embeddings, connection=hana_conn, table_name="VECTORTABLE")
+        hana_vectordb.add_documents(documents)
 
-        # Process and add documents to vector DB
-        cursor = connection.cursor()
-        cursor.execute("SELECT TABLE_NAME FROM SYS.TABLES WHERE SCHEMA_NAME = 'DBADMIN'")
-        tables = [row[0] for row in cursor.fetchall()]
+        # Define the prompt and retrieval chain
+        prompt = ChatPromptTemplate.from_template("""
+        You are an AI chatbot assistant. Answer the user's question based on the provided SAP HANA database data.
+        For initial messages like "hi" or "hello", respond with a welcoming message.
+        Answer in a polite tone using the relevant retrieved information.
 
-        for table_name in tables:
-            cursor.execute(f'SELECT * FROM "{table_name}" LIMIT 100')  # Fetching only 100 rows at a time
-            rows = cursor.fetchall()
-            for row in rows:
-                combined_text = ",".join(str(value) if value else 'NULL' for value in row)
-                document = Document(page_content=combined_text.strip(), metadata={"table": table_name})
-                vector_db.add_documents([document])  # Directly add to vector DB
-
-        # Configure the Hugging Face model
-        llm = HuggingFaceEndpoint(
-            repo_id=selected_model.get("textGeneration") or "mistralai/Mistral-7B-Instruct-v0.3",
-            huggingfacehub_api_token="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"  # Replace with actual token
-        )
-
-        # Define prompt template
-        prompt_template = ChatPromptTemplate.from_template("""
-            You are an expert AI assistant designed to support a vendor onboarding process. Your role is to assist with clear, professional, and helpful responses based on the SAP HANA database data for vendor onboarding statuses.
-            when you get the response use those reponse and give a human form of answer.
-            Give the response in as a customer support person
-            Here is the relevant data for context:
-            based on the relevent data answer according to that
-            {context}
-            
-            Question: {input}
+        {context} 
+        Question: {input}
         """)
+        fetch_count_sql = "SELECT COUNT(*) FROM DBADMIN.DIX_TABLE1"
+        cur.execute(fetch_count_sql)
+        total_records = cur.fetchone()[0]
+        print(f"Total records in the database: {total_records}")
 
-        document_chain = create_stuff_documents_chain(llm, prompt_template)
-        retriever = vector_db.as_retriever()
+        document_chain = create_stuff_documents_chain(llm, prompt)
+        retriever = hana_vectordb.as_retriever(search_type="similarity", search_kwargs={"k": total_records})
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
-        return jsonify({"message": "Configuration completed successfully"})
-    
+        return jsonify({"message": "Database configured and embeddings stored successfully"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/query", methods=["POST"])
-def query():
-    global retrieval_chain, vector_db
+@app.route('/invoke', methods=['POST'])
+def invoke_query():
+    global retrieval_chain, hana_vectordb, total_records
+
+    if not retrieval_chain or not hana_vectordb:
+        return jsonify({"error": "Database not configured. Please configure it first."}), 400
+
+    # Get the user query
+    payload = request.json
+    user_query = payload.get("input", "")
 
     try:
-        query_payload = QueryPayload(**request.json)
-        user_query = query_payload.input
-
-        # Perform similarity search in vector DB
-        docs = vector_db.similarity_search(user_query, k=2)
+        # Search documents and combine context
+        docs = hana_vectordb.similarity_search(user_query, k=total_records)
         combined_context = "\n\n".join([doc.page_content for doc in docs])
-
-        # Debugging: Print combined context to verify retrieved chunks
-        print("Combined Context:\n", combined_context)
 
         # Run the query through the retrieval chain
         response = retrieval_chain.invoke({"input": user_query, "context": combined_context})
 
-        # Debugging: Print response to verify the output format
-        print("Response from retrieval chain:", response)
-
-        # Attempt to retrieve the 'answer' from the response, or use a fallback if missing
-        answer_text = response.get('answer', 'No answer available')
-        
-        return jsonify({
-            "answer": answer_text,
-            "details": {
-                "input": user_query,
-                "context": combined_context,
-                "answer": answer_text,
-            }
-        })
-
+        return jsonify({"answer": response.get("answer", "No answer found")}), 200
     except Exception as e:
-        # Debugging: Print exception for troubleshooting
-        print("Error during query processing:", str(e))
         return jsonify({"error": str(e)}), 500
 
-
 if __name__ == '__main__':
-  # If the app is running locally
-    if cf_port is None:
-    # Use port 5000
-        app.run(host='0.0.0.0', port=5001, debug=True)
-    else:
-    # Else use cloud foundry default port
-        app.run(host='0.0.0.0', port=int(cf_port), debug=False)
+    app.run(debug=True, port=5000)
