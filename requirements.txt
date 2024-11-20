@@ -5,5 +5,5 @@ Document
 langchain_community
 flask
 pydantic
-langchain_huggingface
+gen-ai-hub
 
